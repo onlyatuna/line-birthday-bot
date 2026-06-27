@@ -1,0 +1,21 @@
+services:
+  line-birthday-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: line-birthday-bot
+    restart: always
+    ports:
+      - "127.0.0.1:8081:8080" # 映射容器內的 8080 到宿主機的 8081
+    environment:
+      - LINE_CHANNEL_TOKEN
+      - LINE_CHANNEL_SECRET
+      - ADMIN_LINE_ID
+      - GROUP_LINE_ID
+      - PORT=8080
+      - CRON_SCHEDULE
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

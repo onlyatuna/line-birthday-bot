@@ -1,0 +1,18 @@
+# Environment configurations
+.env
+
+# Compiled binaries
+line-birthday-notifier
+line-birthday-notifier.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Local data files
+birthdays.xlsx
+
+# Go build artifacts and dependencies
+/bin
+/pkg
+/obj
