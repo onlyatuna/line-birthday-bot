@@ -1,8 +1,6 @@
 services:
   line-birthday-bot:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ${IMAGE_TAG:-ghcr.io/onlyatuna/line-birthday-bot:latest}
     container_name: line-birthday-bot
     restart: always
     ports:
