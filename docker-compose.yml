@@ -12,6 +12,8 @@ services:
       - GROUP_LINE_ID
       - PORT=8080
       - CRON_SCHEDULE
+    volumes:
+      - ./birthdays.xlsx:/app/birthdays.xlsx
     logging:
       driver: "json-file"
       options:
