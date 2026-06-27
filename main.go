@@ -291,11 +291,19 @@ func makeCallbackHandler(bot *messaging_api.MessagingApiAPI, cfg Config) http.Ha
 			// Extract and log source information for ID lookup
 			var source webhook.SourceInterface
 			switch ev := event.(type) {
+			case webhook.MessageEvent:
+				source = ev.Source
 			case *webhook.MessageEvent:
+				source = ev.Source
+			case webhook.PostbackEvent:
 				source = ev.Source
 			case *webhook.PostbackEvent:
 				source = ev.Source
+			case webhook.FollowEvent:
+				source = ev.Source
 			case *webhook.FollowEvent:
+				source = ev.Source
+			case webhook.JoinEvent:
 				source = ev.Source
 			case *webhook.JoinEvent:
 				source = ev.Source
@@ -303,16 +311,26 @@ func makeCallbackHandler(bot *messaging_api.MessagingApiAPI, cfg Config) http.Ha
 
 			if source != nil {
 				switch s := source.(type) {
+				case webhook.UserSource:
+					log.Printf("[ID Lookup] Event %T received from User (User ID: %s)", event, s.UserId)
 				case *webhook.UserSource:
 					log.Printf("[ID Lookup] Event %T received from User (User ID: %s)", event, s.UserId)
+				case webhook.GroupSource:
+					log.Printf("[ID Lookup] Event %T received from Group (Group ID: %s, Sender User ID: %s)", event, s.GroupId, s.UserId)
 				case *webhook.GroupSource:
 					log.Printf("[ID Lookup] Event %T received from Group (Group ID: %s, Sender User ID: %s)", event, s.GroupId, s.UserId)
+				case webhook.RoomSource:
+					log.Printf("[ID Lookup] Event %T received from Room (Room ID: %s, Sender User ID: %s)", event, s.RoomId, s.UserId)
 				case *webhook.RoomSource:
 					log.Printf("[ID Lookup] Event %T received from Room (Room ID: %s, Sender User ID: %s)", event, s.RoomId, s.UserId)
 				}
 			}
 
 			switch e := event.(type) {
+			case webhook.PostbackEvent:
+				log.Printf("Postback event received from user %s with data: '%s'", getUserID(e.Source), e.Postback.Data)
+				handlePostback(w, bot, cfg, &e)
+				return // Early return after handling
 			case *webhook.PostbackEvent:
 				log.Printf("Postback event received from user %s with data: '%s'", getUserID(e.Source), e.Postback.Data)
 				handlePostback(w, bot, cfg, e)
