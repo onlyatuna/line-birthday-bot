@@ -1,0 +1,101 @@
+name: CI/CD Pipeline for LINE Bot
+
+on:
+  push:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_TAG: ghcr.io/onlyatuna/line-birthday-bot:latest
+
+jobs:
+  # --- Job 1: Build and Push Docker Image ---
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # --- Job 2: Deploy to GCP via SSH ---
+  deploy:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Add GCP host to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.GCP_PROD_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Copy docker-compose file to GCP
+        uses: appleboy/scp-action@v1.0.0
+        with:
+          host: ${{ secrets.GCP_PROD_HOST }}
+          username: ${{ secrets.GCP_PROD_USERNAME }}
+          key: ${{ secrets.GCP_PROD_SSH_KEY }}
+          source: "docker-compose.yml"
+          # 部署至伺服器上的 line-birthday-bot 獨立資料夾
+          target: "~/line-birthday-bot/"
+
+      - name: Deploy to GCP via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.GCP_PROD_HOST }}
+          username: ${{ secrets.GCP_PROD_USERNAME }}
+          key: ${{ secrets.GCP_PROD_SSH_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          envs: LINE_CHANNEL_TOKEN,LINE_CHANNEL_SECRET,ADMIN_LINE_ID,GROUP_LINE_ID,CRON_SCHEDULE
+          script: |
+            mkdir -p ~/line-birthday-bot
+            cd ~/line-birthday-bot || exit 1
+            
+            # 1. 登入 GitHub Container Registry
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+            
+            # 2. 拉取最新版本的機器人映像檔
+            docker pull "${{ env.IMAGE_TAG }}"
+            
+            # 3. 將 GitHub Secrets 作為環境變數帶入，並重建容器
+            LINE_CHANNEL_TOKEN=$LINE_CHANNEL_TOKEN \
+            LINE_CHANNEL_SECRET=$LINE_CHANNEL_SECRET \
+            ADMIN_LINE_ID=$ADMIN_LINE_ID \
+            GROUP_LINE_ID=$GROUP_LINE_ID \
+            CRON_SCHEDULE=$CRON_SCHEDULE \
+            IMAGE_TAG=${{ env.IMAGE_TAG }} \
+            docker compose up -d --force-recreate line-birthday-bot
+            
+            # 4. 清理舊 Image 釋放磁碟空間
+            docker image prune -f
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_CHANNEL_SECRET: ${{ secrets.LINE_CHANNEL_SECRET }}
+          ADMIN_LINE_ID: ${{ secrets.ADMIN_LINE_ID }}
+          GROUP_LINE_ID: ${{ secrets.GROUP_LINE_ID }}
+          CRON_SCHEDULE: ${{ secrets.CRON_SCHEDULE }}
