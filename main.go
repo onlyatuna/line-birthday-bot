@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -8,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -34,6 +36,18 @@ type BirthdayRecord struct {
 	Birthday string // Format: MM-DD
 }
 
+// RuntimeConfig holds dynamic settings modified via chat commands.
+type RuntimeConfig struct {
+	GroupLineID      string `json:"group_line_id"`
+	GreetingTemplate string `json:"greeting_template"`
+}
+
+var (
+	runtimeConfig     RuntimeConfig
+	runtimeConfigMu   sync.RWMutex
+	runtimeConfigPath = "config.json"
+)
+
 func main() {
 	log.Println("Starting LINE Bot Birthday Review and Broadcast System...")
 
@@ -44,6 +58,9 @@ func main() {
 
 	// 1. Load configuration
 	cfg := loadConfig()
+
+	// Load dynamic runtime config (falling back to env GROUP_LINE_ID if config.json not set)
+	loadRuntimeConfig(cfg.GroupLineID)
 
 	// 2. Load location Asia/Taipei
 	loc, err := time.LoadLocation("Asia/Taipei")
@@ -341,6 +358,12 @@ func makeCallbackHandler(bot *messaging_api.MessagingApiAPI, cfg Config) http.Ha
 				log.Printf("Postback event received from user %s with data: '%s'", getUserID(e.Source), e.Postback.Data)
 				handlePostback(w, bot, cfg, e)
 				return // Early return after handling
+			case webhook.MessageEvent:
+				handleMessage(w, bot, cfg, &e)
+				return
+			case *webhook.MessageEvent:
+				handleMessage(w, bot, cfg, e)
+				return
 			default:
 				// Ignore other event types quietly
 				log.Printf("Ignored event type: %T", event)
@@ -380,19 +403,20 @@ func handlePostback(w http.ResponseWriter, bot *messaging_api.MessagingApiAPI, c
 	names := strings.Split(namesStr, ",")
 	formattedNames := strings.Join(names, "、")
 
-	var greeting string
+	dayWord := "今天"
 	if dayType == "tomorrow" {
-		greeting = fmt.Sprintf("祝明天生日的 %s 生日快樂！🎉🎂", formattedNames)
-	} else {
-		// default to today
-		greeting = fmt.Sprintf("祝今天生日的 %s 生日快樂！🎉🎂", formattedNames)
+		dayWord = "明天"
 	}
+	template := getGreetingTemplate()
+	greeting := strings.ReplaceAll(template, "{day}", dayWord)
+	greeting = strings.ReplaceAll(greeting, "{names}", formattedNames)
 
 	// 1. Broadcast greeting to target Group
-	log.Printf("Broadcasting greeting message to group %s", cfg.GroupLineID)
+	targetGroup := getGroupLineID()
+	log.Printf("Broadcasting greeting message to group %s", targetGroup)
 	_, err = bot.PushMessage(
 		&messaging_api.PushMessageRequest{
-			To: cfg.GroupLineID,
+			To: targetGroup,
 			Messages: []messaging_api.MessageInterface{
 				&messaging_api.TextMessage{
 					Text: greeting,
@@ -478,4 +502,196 @@ func getUserID(source webhook.SourceInterface) string {
 	}
 	return ""
 }
+
+// loadRuntimeConfig reads config.json or populates default settings.
+func loadRuntimeConfig(fallbackGroup string) {
+	runtimeConfigMu.Lock()
+	defer runtimeConfigMu.Unlock()
+
+	runtimeConfig.GroupLineID = fallbackGroup
+	runtimeConfig.GreetingTemplate = "祝{day}生日的 {names} 生日快樂！🎉🎂"
+
+	file, err := os.Open(runtimeConfigPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			log.Println("config.json does not exist. Initializing with default values.")
+			data, _ := json.MarshalIndent(runtimeConfig, "", "  ")
+			_ = os.WriteFile(runtimeConfigPath, data, 0644)
+			return
+		}
+		log.Printf("Failed to open config.json: %v", err)
+		return
+	}
+	defer file.Close()
+
+	var loaded RuntimeConfig
+	if err := json.NewDecoder(file).Decode(&loaded); err != nil {
+		log.Printf("Failed to decode config.json: %v", err)
+		return
+	}
+
+	if loaded.GroupLineID != "" {
+		runtimeConfig.GroupLineID = loaded.GroupLineID
+	}
+	if loaded.GreetingTemplate != "" {
+		runtimeConfig.GreetingTemplate = loaded.GreetingTemplate
+	}
+	log.Printf("Successfully loaded runtime config from config.json. Group: %s, Template: %s", runtimeConfig.GroupLineID, runtimeConfig.GreetingTemplate)
+}
+
+// saveRuntimeConfig writes current runtime settings to config.json.
+func saveRuntimeConfig() error {
+	runtimeConfigMu.RLock()
+	defer runtimeConfigMu.RUnlock()
+
+	data, err := json.MarshalIndent(runtimeConfig, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(runtimeConfigPath, data, 0644)
+}
+
+func getGroupLineID() string {
+	runtimeConfigMu.RLock()
+	defer runtimeConfigMu.RUnlock()
+	return runtimeConfig.GroupLineID
+}
+
+func getGreetingTemplate() string {
+	runtimeConfigMu.RLock()
+	defer runtimeConfigMu.RUnlock()
+	return runtimeConfig.GreetingTemplate
+}
+
+func setGroupLineID(groupID string) error {
+	runtimeConfigMu.Lock()
+	runtimeConfig.GroupLineID = groupID
+	runtimeConfigMu.Unlock()
+	return saveRuntimeConfig()
+}
+
+func setGreetingTemplate(temp string) error {
+	runtimeConfigMu.Lock()
+	runtimeConfig.GreetingTemplate = temp
+	runtimeConfigMu.Unlock()
+	return saveRuntimeConfig()
+}
+
+// handleMessage processes text messages, routing command structures if sent by Admin.
+func handleMessage(w http.ResponseWriter, bot *messaging_api.MessagingApiAPI, cfg Config, e *webhook.MessageEvent) {
+	var isAdminPrivateChat bool
+	if e.Source != nil {
+		switch s := e.Source.(type) {
+		case *webhook.UserSource:
+			if s.UserId == cfg.AdminLineID {
+				isAdminPrivateChat = true
+			}
+		case webhook.UserSource:
+			if s.UserId == cfg.AdminLineID {
+				isAdminPrivateChat = true
+			}
+		}
+	}
+
+	if !isAdminPrivateChat {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	switch message := e.Message.(type) {
+	case *webhook.TextMessageContent:
+		text := message.Text
+		if strings.HasPrefix(text, "/") {
+			log.Printf("Admin sent command: '%s'", text)
+			handleAdminCommand(bot, e.ReplyToken, text)
+		}
+	case webhook.TextMessageContent:
+		text := message.Text
+		if strings.HasPrefix(text, "/") {
+			log.Printf("Admin sent command: '%s'", text)
+			handleAdminCommand(bot, e.ReplyToken, text)
+		}
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+// handleAdminCommand routes and executes slash commands.
+func handleAdminCommand(bot *messaging_api.MessagingApiAPI, replyToken string, text string) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "/") {
+		return
+	}
+
+	parts := strings.SplitN(text, " ", 2)
+	command := parts[0]
+	args := ""
+	if len(parts) > 1 {
+		args = strings.TrimSpace(parts[1])
+	}
+
+	switch command {
+	case "/help":
+		helpText := "可用指令：\n" +
+			"1. /show : 顯示目前群組 ID 與祝賀詞範本\n" +
+			"2. /setgroup [群組ID] : 設定發送群組\n" +
+			"3. /settemplate [範本] : 設定祝賀詞範本（可用 {day} 與 {names}）\n" +
+			"4. /help : 顯示此幫助訊息"
+		replyText(bot, replyToken, helpText)
+
+	case "/show":
+		group := getGroupLineID()
+		template := getGreetingTemplate()
+		info := fmt.Sprintf("目前設定：\n- 群組 ID: %s\n- 祝賀詞範本: %s", group, template)
+		replyText(bot, replyToken, info)
+
+	case "/setgroup":
+		if args == "" {
+			replyText(bot, replyToken, "請提供群組 ID，例如：\n/setgroup Cxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx")
+			return
+		}
+		if !strings.HasPrefix(args, "C") || len(args) != 33 {
+			replyText(bot, replyToken, "無效認證格式：通常以 'C' 開頭，共 33 碼的群組 ID")
+			return
+		}
+		if err := setGroupLineID(args); err != nil {
+			replyText(bot, replyToken, fmt.Sprintf("儲存群組 ID 失敗：%v", err))
+			return
+		}
+		replyText(bot, replyToken, fmt.Sprintf("設定群組 ID 成功！\n目前群組 ID：%s", args))
+
+	case "/settemplate":
+		if args == "" {
+			replyText(bot, replyToken, "請提供祝賀詞範本，例如：\n/settemplate 祝{day}生日的 {names} 生日快樂！🎉")
+			return
+		}
+		if err := setGreetingTemplate(args); err != nil {
+			replyText(bot, replyToken, fmt.Sprintf("儲存祝賀詞範本失敗：%v", err))
+			return
+		}
+		replyText(bot, replyToken, fmt.Sprintf("設定祝賀詞範本成功！\n目前範本：%s", args))
+
+	default:
+		replyText(bot, replyToken, fmt.Sprintf("未知指令 '%s'，輸入 /help 查看可用指令。", command))
+	}
+}
+
+func replyText(bot *messaging_api.MessagingApiAPI, replyToken string, text string) {
+	if bot == nil {
+		log.Printf("[Test Mode] Reply text: %q", text)
+		return
+	}
+	_, err := bot.ReplyMessage(&messaging_api.ReplyMessageRequest{
+		ReplyToken: replyToken,
+		Messages: []messaging_api.MessageInterface{
+			&messaging_api.TextMessage{
+				Text: text,
+			},
+		},
+	})
+	if err != nil {
+		log.Printf("Failed to reply message: %v", err)
+	}
+}
+
 
