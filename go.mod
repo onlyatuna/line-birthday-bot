@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	github.com/joho/godotenv v1.5.1
-	github.com/line/line-bot-sdk-go/v8 v8.6.0
+	github.com/line/line-bot-sdk-go/v8 v8.10.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/xuri/excelize/v2 v2.8.1
 )

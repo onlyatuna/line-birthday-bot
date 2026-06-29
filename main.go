@@ -35,18 +35,23 @@ type Config struct {
 type BirthdayRecord struct {
 	Name     string
 	Birthday string // Format: MM-DD
+	LineID   string // Optional: LINE User ID for tagging/mentioning
 }
 
 // RuntimeConfig holds dynamic settings modified via chat commands.
 type RuntimeConfig struct {
 	GroupLineID      string `json:"group_line_id"`
 	GreetingTemplate string `json:"greeting_template"`
+	ReviewTemplate   string `json:"review_template"`
 }
 
 var (
 	runtimeConfig     RuntimeConfig
 	runtimeConfigMu   sync.RWMutex
 	runtimeConfigPath = "data/config.json"
+
+	membersMu       sync.Mutex
+	membersFilePath = "data/members.json"
 )
 
 func main() {
@@ -177,6 +182,10 @@ func readBirthdays(filename string) ([]BirthdayRecord, error) {
 
 		name := strings.TrimSpace(row[0])
 		birthday := strings.TrimSpace(row[1])
+		var lineID string
+		if len(row) >= 3 {
+			lineID = strings.TrimSpace(row[2])
+		}
 
 		// Skip header or empty rows dynamically by validating formatting of column 2 (Birthday)
 		if name == "" || birthday == "" || !isValidBirthdayFormat(birthday) {
@@ -189,6 +198,7 @@ func readBirthdays(filename string) ([]BirthdayRecord, error) {
 		records = append(records, BirthdayRecord{
 			Name:     name,
 			Birthday: birthday,
+			LineID:   lineID,
 		})
 	}
 
@@ -252,7 +262,10 @@ func sendReviewMessage(bot *messaging_api.MessagingApiAPI, adminID string, dayTy
 	}
 
 	namesList := strings.Join(names, "、")
-	text := fmt.Sprintf("%s (%s) 生日人員：%s\n請審查是否在群組發布祝賀訊息。", dayName, dateStr, namesList)
+	template := getReviewTemplate()
+	text := strings.ReplaceAll(template, "{day}", dayName)
+	text = strings.ReplaceAll(text, "{date}", dateStr)
+	text = strings.ReplaceAll(text, "{names}", namesList)
 	// Alt text fallback
 	altText := fmt.Sprintf("生日推播審查：%s生日的人有 %s", dayName, namesList)
 
@@ -334,6 +347,7 @@ func makeCallbackHandler(bot *messaging_api.MessagingApiAPI, cfg Config) http.Ha
 			}
 
 			if source != nil {
+				var groupID, userID string
 				switch s := source.(type) {
 				case webhook.UserSource:
 					log.Printf("[ID Lookup] Event %T received from User (User ID: %s)", event, s.UserId)
@@ -341,12 +355,19 @@ func makeCallbackHandler(bot *messaging_api.MessagingApiAPI, cfg Config) http.Ha
 					log.Printf("[ID Lookup] Event %T received from User (User ID: %s)", event, s.UserId)
 				case webhook.GroupSource:
 					log.Printf("[ID Lookup] Event %T received from Group (Group ID: %s, Sender User ID: %s)", event, s.GroupId, s.UserId)
+					groupID = s.GroupId
+					userID = s.UserId
 				case *webhook.GroupSource:
 					log.Printf("[ID Lookup] Event %T received from Group (Group ID: %s, Sender User ID: %s)", event, s.GroupId, s.UserId)
+					groupID = s.GroupId
+					userID = s.UserId
 				case webhook.RoomSource:
 					log.Printf("[ID Lookup] Event %T received from Room (Room ID: %s, Sender User ID: %s)", event, s.RoomId, s.UserId)
 				case *webhook.RoomSource:
 					log.Printf("[ID Lookup] Event %T received from Room (Room ID: %s, Sender User ID: %s)", event, s.RoomId, s.UserId)
+				}
+				if groupID != "" && userID != "" {
+					go collectGroupMember(bot, groupID, userID)
 				}
 			}
 
@@ -402,15 +423,15 @@ func handlePostback(w http.ResponseWriter, bot *messaging_api.MessagingApiAPI, c
 	}
 
 	names := strings.Split(namesStr, ",")
-	formattedNames := strings.Join(names, "、")
-
-	dayWord := "今天"
-	if dayType == "tomorrow" {
-		dayWord = "明天"
+	
+	// Read records to lookup LINE IDs
+	records, err := readBirthdays(cfg.ExcelPath)
+	if err != nil {
+		log.Printf("Failed to read birthdays for postback lookup: %v (will send plain text message)", err)
 	}
-	template := getGreetingTemplate()
-	greeting := strings.ReplaceAll(template, "{day}", dayWord)
-	greeting = strings.ReplaceAll(greeting, "{names}", formattedNames)
+
+	// Construct message (supporting v2 text message with mentions if IDs are present)
+	message := createGreetingMessage(dayType, names, records)
 
 	// 1. Broadcast greeting to target Group
 	targetGroup := getGroupLineID()
@@ -419,9 +440,7 @@ func handlePostback(w http.ResponseWriter, bot *messaging_api.MessagingApiAPI, c
 		&messaging_api.PushMessageRequest{
 			To: targetGroup,
 			Messages: []messaging_api.MessageInterface{
-				&messaging_api.TextMessage{
-					Text: greeting,
-				},
+				message,
 			},
 		},
 		"",
@@ -434,9 +453,31 @@ func handlePostback(w http.ResponseWriter, bot *messaging_api.MessagingApiAPI, c
 		return
 	}
 
+	// Generate a plain text representation of the greeting for the admin reply
+	dayWord := "今天"
+	if dayType == "tomorrow" {
+		dayWord = "明天"
+	}
+	nameToID := make(map[string]string)
+	for _, r := range records {
+		if r.LineID != "" {
+			nameToID[r.Name] = r.LineID
+		}
+	}
+	var plainNames []string
+	for _, name := range names {
+		if nameToID[name] != "" {
+			plainNames = append(plainNames, "@"+name)
+		} else {
+			plainNames = append(plainNames, name)
+		}
+	}
+	plainGreeting := strings.ReplaceAll(getGreetingTemplate(), "{day}", dayWord)
+	plainGreeting = strings.ReplaceAll(plainGreeting, "{names}", strings.Join(plainNames, "、"))
+
 	// 2. Reply to admin indicating success
 	log.Println("Broadcast succeeded. Replying success status to admin.")
-	replySuccess(bot, e.ReplyToken, fmt.Sprintf("生日祝賀已成功發布！\n內容：%s", greeting))
+	replySuccess(bot, e.ReplyToken, fmt.Sprintf("生日祝賀已成功發布！\n內容：%s", plainGreeting))
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -511,6 +552,7 @@ func loadRuntimeConfig(fallbackGroup string) {
 
 	runtimeConfig.GroupLineID = fallbackGroup
 	runtimeConfig.GreetingTemplate = "祝{day}生日的 {names} 生日快樂！🎉🎂"
+	runtimeConfig.ReviewTemplate = "{day} ({date}) 生日人員：{names}\n請審查是否在群組發布祝賀訊息。"
 
 	file, err := os.Open(runtimeConfigPath)
 	if err != nil {
@@ -540,6 +582,9 @@ func loadRuntimeConfig(fallbackGroup string) {
 	}
 	if loaded.GreetingTemplate != "" {
 		runtimeConfig.GreetingTemplate = loaded.GreetingTemplate
+	}
+	if loaded.ReviewTemplate != "" {
+		runtimeConfig.ReviewTemplate = loaded.ReviewTemplate
 	}
 	log.Printf("Successfully loaded runtime config from %s. Group: %s, Template: %s", runtimeConfigPath, runtimeConfig.GroupLineID, runtimeConfig.GreetingTemplate)
 }
@@ -584,6 +629,19 @@ func setGroupLineID(groupID string) error {
 func setGreetingTemplate(temp string) error {
 	runtimeConfigMu.Lock()
 	runtimeConfig.GreetingTemplate = temp
+	runtimeConfigMu.Unlock()
+	return saveRuntimeConfig()
+}
+
+func getReviewTemplate() string {
+	runtimeConfigMu.RLock()
+	defer runtimeConfigMu.RUnlock()
+	return runtimeConfig.ReviewTemplate
+}
+
+func setReviewTemplate(temp string) error {
+	runtimeConfigMu.Lock()
+	runtimeConfig.ReviewTemplate = temp
 	runtimeConfigMu.Unlock()
 	return saveRuntimeConfig()
 }
@@ -644,16 +702,42 @@ func handleAdminCommand(bot *messaging_api.MessagingApiAPI, replyToken string, t
 	switch command {
 	case "/help":
 		helpText := "可用指令：\n" +
-			"1. /show : 顯示目前群組 ID 與祝賀詞範本\n" +
+			"1. /show : 顯示目前設定值\n" +
 			"2. /setgroup [群組ID] : 設定發送群組\n" +
-			"3. /settemplate [範本] : 設定祝賀詞範本（可用 {day} 與 {names}）\n" +
-			"4. /help : 顯示此幫助訊息"
+			"3. /settemplate [範本] : 設定祝賀詞範本（可使用 {day} 與 {names}）\n" +
+			"4. /setreviewtemplate [範本] : 設定管理員審查訊息範本（可使用 {day}、{date} 與 {names}）\n" +
+			"5. /listmembers : 顯示已蒐集的群組成員與 ID 列表\n" +
+			"6. /help : 顯示此幫助訊息"
 		replyText(bot, replyToken, helpText)
+
+	case "/listmembers":
+		membersMu.Lock()
+		members := make(map[string]string)
+		if file, err := os.Open(membersFilePath); err == nil {
+			_ = json.NewDecoder(file).Decode(&members)
+			file.Close()
+		}
+		membersMu.Unlock()
+
+		if len(members) == 0 {
+			replyText(bot, replyToken, "目前尚未蒐集到任何群組成員。請讓成員在群組中發言或點擊按鈕後再試！")
+			return
+		}
+
+		var sb strings.Builder
+		sb.WriteString("已蒐集的群組成員名單（名稱 : LINE ID）：\n")
+		idx := 1
+		for id, name := range members {
+			sb.WriteString(fmt.Sprintf("%d. %s : %s\n", idx, name, id))
+			idx++
+		}
+		replyText(bot, replyToken, sb.String())
 
 	case "/show":
 		group := getGroupLineID()
 		template := getGreetingTemplate()
-		info := fmt.Sprintf("目前設定：\n- 群組 ID: %s\n- 祝賀詞範本: %s", group, template)
+		review := getReviewTemplate()
+		info := fmt.Sprintf("目前設定：\n- 群組 ID: %s\n- 祝賀詞範本: %s\n- 審查訊息範本: %s", group, template, review)
 		replyText(bot, replyToken, info)
 
 	case "/setgroup":
@@ -682,6 +766,17 @@ func handleAdminCommand(bot *messaging_api.MessagingApiAPI, replyToken string, t
 		}
 		replyText(bot, replyToken, fmt.Sprintf("設定祝賀詞範本成功！\n目前範本：%s", args))
 
+	case "/setreviewtemplate":
+		if args == "" {
+			replyText(bot, replyToken, "請提供審查訊息範本，例如：\n/setreviewtemplate {day} ({date}) 生日人員：{names}\n請審查是否發送。")
+			return
+		}
+		if err := setReviewTemplate(args); err != nil {
+			replyText(bot, replyToken, fmt.Sprintf("儲存審查訊息範本失敗：%v", err))
+			return
+		}
+		replyText(bot, replyToken, fmt.Sprintf("設定審查訊息範本成功！\n目前範本：%s", args))
+
 	default:
 		replyText(bot, replyToken, fmt.Sprintf("未知指令 '%s'，輸入 /help 查看可用指令。", command))
 	}
@@ -702,6 +797,149 @@ func replyText(bot *messaging_api.MessagingApiAPI, replyToken string, text strin
 	})
 	if err != nil {
 		log.Printf("Failed to reply message: %v", err)
+	}
+}
+
+// CustomTextMessageV2 implements messaging_api.MessageInterface and bypasses the SDK's Substitution type restriction.
+type CustomTextMessageV2 struct {
+	messaging_api.Message
+	QuickReply   *messaging_api.QuickReply `json:"quickReply,omitempty"`
+	Sender       *messaging_api.Sender     `json:"sender,omitempty"`
+	Text         string                    `json:"text"`
+	Substitution map[string]any            `json:"substitution,omitempty"`
+	QuoteToken   string                    `json:"quoteToken,omitempty"`
+}
+
+func (r *CustomTextMessageV2) GetType() string {
+	return "textV2"
+}
+
+func (r *CustomTextMessageV2) MarshalJSON() ([]byte, error) {
+	type Alias CustomTextMessageV2
+	return json.Marshal(&struct {
+		*Alias
+		Type string `json:"type"`
+	}{
+		Alias: (*Alias)(r),
+		Type:  "textV2",
+	})
+}
+
+// createGreetingMessage constructs either a CustomTextMessageV2 (with mentions) or a standard TextMessage.
+func createGreetingMessage(dayType string, names []string, records []BirthdayRecord) messaging_api.MessageInterface {
+	dayWord := "今天"
+	if dayType == "tomorrow" {
+		dayWord = "明天"
+	}
+
+	// Build a map of name -> LineID from records
+	nameToID := make(map[string]string)
+	for _, r := range records {
+		if r.Name != "" && r.LineID != "" {
+			nameToID[r.Name] = r.LineID
+		}
+	}
+
+	// Construct the formatted names list and substitution map
+	var nameParts []string
+	substitutions := make(map[string]any)
+	mentionCount := 0
+
+	for _, name := range names {
+		lineID := nameToID[name]
+		if lineID != "" {
+			placeholder := fmt.Sprintf("user_%d", mentionCount)
+			// Format placeholder in text as {placeholder}
+			nameParts = append(nameParts, fmt.Sprintf("{%s}", placeholder))
+			
+			// Add to substitution map
+			substitutions[placeholder] = &messaging_api.MentionSubstitutionObject{
+				SubstitutionObject: messaging_api.SubstitutionObject{
+					Type: "mention",
+				},
+				Mentionee: &messaging_api.UserMentionTarget{
+					MentionTarget: messaging_api.MentionTarget{
+						Type: "user",
+					},
+					UserId: lineID,
+				},
+			}
+			mentionCount++
+		} else {
+			// No LINE ID, output plain text name
+			nameParts = append(nameParts, name)
+		}
+	}
+
+	formattedNames := strings.Join(nameParts, "、")
+	template := getGreetingTemplate()
+	greetingText := strings.ReplaceAll(template, "{day}", dayWord)
+	greetingText = strings.ReplaceAll(greetingText, "{names}", formattedNames)
+
+	if len(substitutions) > 0 {
+		return &CustomTextMessageV2{
+			Text:         greetingText,
+			Substitution: substitutions,
+		}
+	}
+
+	return &messaging_api.TextMessage{
+		Text: greetingText,
+	}
+}
+
+// collectGroupMember passively retrieves user profiles and saves them to members.json.
+func collectGroupMember(bot *messaging_api.MessagingApiAPI, groupID string, userID string) {
+	if bot == nil || groupID == "" || userID == "" {
+		return
+	}
+
+	membersMu.Lock()
+	// Load existing members to check if we already have it
+	members := make(map[string]string)
+	if file, err := os.Open(membersFilePath); err == nil {
+		_ = json.NewDecoder(file).Decode(&members)
+		file.Close()
+	}
+	if _, exists := members[userID]; exists {
+		membersMu.Unlock()
+		return // Already collected, skip to avoid spamming the LINE API
+	}
+	membersMu.Unlock() // Unlock before network API call to avoid blocking
+
+	// Query LINE API
+	profile, err := bot.GetGroupMemberProfile(groupID, userID)
+	if err != nil {
+		log.Printf("Failed to get profile for group member %s in group %s: %v", userID, groupID, err)
+		return
+	}
+
+	// Re-acquire lock to write to file safely
+	membersMu.Lock()
+	defer membersMu.Unlock()
+
+	// Re-load in case another thread updated it
+	members = make(map[string]string)
+	if file, err := os.Open(membersFilePath); err == nil {
+		_ = json.NewDecoder(file).Decode(&members)
+		file.Close()
+	}
+
+	members[userID] = profile.DisplayName
+
+	// Save back to JSON
+	dir := filepath.Dir(membersFilePath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Failed to create directory %s: %v", dir, err)
+	}
+
+	data, err := json.MarshalIndent(members, "", "  ")
+	if err == nil {
+		if err := os.WriteFile(membersFilePath, data, 0644); err != nil {
+			log.Printf("Failed to write members to %s: %v", membersFilePath, err)
+		} else {
+			log.Printf("[Member Collector] Passive collection successful: %s -> %s", profile.DisplayName, userID)
+		}
 	}
 }
 
