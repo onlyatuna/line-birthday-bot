@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,7 +46,7 @@ type RuntimeConfig struct {
 var (
 	runtimeConfig     RuntimeConfig
 	runtimeConfigMu   sync.RWMutex
-	runtimeConfigPath = "config.json"
+	runtimeConfigPath = "data/config.json"
 )
 
 func main() {
@@ -514,19 +515,23 @@ func loadRuntimeConfig(fallbackGroup string) {
 	file, err := os.Open(runtimeConfigPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			log.Println("config.json does not exist. Initializing with default values.")
+			log.Printf("%s does not exist. Initializing with default values.", runtimeConfigPath)
+			dir := filepath.Dir(runtimeConfigPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				log.Printf("Failed to create directory %s: %v", dir, err)
+			}
 			data, _ := json.MarshalIndent(runtimeConfig, "", "  ")
 			_ = os.WriteFile(runtimeConfigPath, data, 0644)
 			return
 		}
-		log.Printf("Failed to open config.json: %v", err)
+		log.Printf("Failed to open %s: %v", runtimeConfigPath, err)
 		return
 	}
 	defer file.Close()
 
 	var loaded RuntimeConfig
 	if err := json.NewDecoder(file).Decode(&loaded); err != nil {
-		log.Printf("Failed to decode config.json: %v", err)
+		log.Printf("Failed to decode %s: %v", runtimeConfigPath, err)
 		return
 	}
 
@@ -536,7 +541,7 @@ func loadRuntimeConfig(fallbackGroup string) {
 	if loaded.GreetingTemplate != "" {
 		runtimeConfig.GreetingTemplate = loaded.GreetingTemplate
 	}
-	log.Printf("Successfully loaded runtime config from config.json. Group: %s, Template: %s", runtimeConfig.GroupLineID, runtimeConfig.GreetingTemplate)
+	log.Printf("Successfully loaded runtime config from %s. Group: %s, Template: %s", runtimeConfigPath, runtimeConfig.GroupLineID, runtimeConfig.GreetingTemplate)
 }
 
 // saveRuntimeConfig writes current runtime settings to config.json.
@@ -548,6 +553,12 @@ func saveRuntimeConfig() error {
 	if err != nil {
 		return err
 	}
+	
+	dir := filepath.Dir(runtimeConfigPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		log.Printf("Failed to create directory %s: %v", dir, err)
+	}
+	
 	return os.WriteFile(runtimeConfigPath, data, 0644)
 }
 
