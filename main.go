@@ -25,6 +25,7 @@ type Config struct {
 	GroupLineID       string
 	Port              string
 	CronSchedule      string
+	ExcelPath         string
 }
 
 // BirthdayRecord represents a single row parsed from the Excel file.
@@ -90,6 +91,11 @@ func loadConfig() Config {
 		GroupLineID:       os.Getenv("GROUP_LINE_ID"),
 		Port:              os.Getenv("PORT"),
 		CronSchedule:      os.Getenv("CRON_SCHEDULE"),
+		ExcelPath:         os.Getenv("EXCEL_PATH"),
+	}
+
+	if cfg.ExcelPath == "" {
+		cfg.ExcelPath = "data/birthdays.xlsx"
 	}
 
 	// Validation
@@ -180,7 +186,7 @@ func isValidBirthdayFormat(val string) bool {
 
 // checkAndNotify scans birthdays and sends review messages to the admin if today/tomorrow contains birthdays.
 func checkAndNotify(bot *messaging_api.MessagingApiAPI, cfg Config, loc *time.Location) {
-	records, err := readBirthdays("birthdays.xlsx")
+	records, err := readBirthdays(cfg.ExcelPath)
 	if err != nil {
 		log.Printf("Error reading birthdays: %v", err)
 		return

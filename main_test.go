@@ -29,9 +29,9 @@ func TestIsValidBirthdayFormat(t *testing.T) {
 }
 
 func TestReadBirthdays(t *testing.T) {
-	records, err := readBirthdays("birthdays.xlsx")
+	records, err := readBirthdays("data/birthdays.xlsx")
 	if err != nil {
-		t.Fatalf("Failed to read birthdays from excel: %v", err)
+		t.Fatalf("Expected no error reading excel, got %v", err)
 	}
 
 	// From scratch data:
